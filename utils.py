@@ -607,6 +607,19 @@ class GroupConv2D(keras.layers.Layer):
         x = keras.layers.concatenate(feature_map_list, axis=-1)
         
         return x
+
+
+class DummyBlock(keras.layers.Layer):
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def get_config(self):
+        config = super().get_config()
+        return config
+
+    def call(self, x, training):
+        return x
     
 
 class ResidualBlock(keras.layers.Layer):
@@ -723,13 +736,11 @@ class SpatialSE(layers.Layer):
         Attention modified feature maps.
     """
 
-    def __init__(self, ratio, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.ratio = ratio
 
     def get_config(self):
         config = super().get_config()
-        config.update({"ratio": self.ratio})
         return config
 
     def build(self, input_shape):
