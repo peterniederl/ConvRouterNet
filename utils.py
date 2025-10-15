@@ -240,6 +240,44 @@ class ResidualBlockDepthwise7x7(keras.layers.Layer):
         y = self.relu(y)
         return y
     
+class ResidualBlockDepthwise9x9(keras.layers.Layer):
+    def __init__(self, filters, block_reduction=1, groups=1, kernel_size=(9, 9), **kwargs):
+        super().__init__(**kwargs)
+        self.filters = filters
+        self.block_reduction = block_reduction
+        self.groups = groups
+        self.kernel_size = kernel_size
+        
+    def get_config(self):
+        config = super().get_config()
+        config.update({"filters": self.filters})
+        config.update({"block_reduction": self.block_reduction})
+        config.update({"groups": self.groups})
+        config.update({"kernel_size": self.kernel_size})
+        return config
+
+    def build(self, input_shape):
+        self.conv1 = Conv2D(self.filters // self.block_reduction, kernel_size=[1, 1], padding='same')
+        self.relu1 = layers.Activation("swish")
+        self.conv2 = DepthwiseConv2D(kernel_size=[9, 9], padding='same')
+        self.norm2 = LayerNormalization()
+        self.conv3 = DepthwiseConv2D(kernel_size=[9, 9], padding='same')
+        self.norm3 = LayerNormalization()
+        self.relu3 = layers.Activation("swish")
+        self.conv4 = Conv2D(self.filters, kernel_size=[1, 1], padding='same')
+        self.add = Add()
+        self.relu = layers.Activation("swish")
+
+    def call(self, x, training=None):
+        shortcut = x #self.proj_norm(self.projection(x))
+        y = self.relu1(self.conv1(x))
+        y = self.norm2(self.conv2(y))
+        y = self.relu3(self.norm3(self.conv3(y)))
+        y = self.conv4(y)
+        y = self.add([shortcut, y])
+        y = self.relu(y)
+        return y
+    
 
 class ResidualBlock5x5(keras.layers.Layer):
     def __init__(self, filters, block_reduction=1, groups=1, kernel_size=(5, 5), **kwargs):
@@ -695,14 +733,9 @@ class SpatialSE(layers.Layer):
         return config
 
     def build(self, input_shape):
-        self.reduction = GroupConv2D(input_channels=input_shape[-1],
-                                output_channels=self.ratio, 
-                                kernel_size=[5, 5], 
-                                padding='same',
-                                groups=self.ratio,
-                                use_bias=False)
-        self.relu = layers.Activation("relu")
-        self.attn = Conv2D(1, kernel_size=(7, 7), padding='same', use_bias=False, activation="softmax", kernel_initializer="he_normal")
+        self.reduction = DepthwiseConv2D(kernel_size=[5, 5], padding='same', use_bias=False)
+        self.relu = layers.Activation("swish")
+        self.attn = Conv2D(1, kernel_size=(7, 7), padding='same', use_bias=False, activation="sigmoid", kernel_initializer="he_normal")
         self.multiply = layers.Multiply()
 
     def call(self, x):
