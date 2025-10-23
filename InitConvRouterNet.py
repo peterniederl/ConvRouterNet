@@ -6,7 +6,8 @@ from utils import (
     ResidualBlockDepthwise3x3, ResidualBlockDepthwise5x5, ResidualBlockDepthwise7x7, ResidualBlockDepthwise9x9, 
     DummyBlock, Conv3x3PoolingLayer, Depthwise3x3ConvPoolingLayer, MaxPoolingLayer, AvgPoolingLayer,
     Conv5x5PoolingLayer, Depthwise5x5ConvPoolingLayer, Depthwise7x7ConvPoolingLayer, AdaptiveRouter,
-    ConvStem, DepthwiseConvStem, SpatialAttention, AdaptiveRouterMultiStep, SparseAdaptiveRouterMultiStep
+    ConvStem, DepthwiseConvStem, SpatialAttention, AdaptiveRouterMultiStep, SparseAdaptiveRouterMultiStep, EfficientMultiStepRouter,
+    EfficientResidualBlockDepthwise3x3, EfficientResidualBlockDepthwise5x5, EfficientResidualBlockDepthwise7x7
 )
 
 def get_init_stem(filters, name, top_n, router_temp, diversity_tau):
@@ -170,6 +171,56 @@ def get_multi_step_sparse_init_block(filters, name, top_n, router_temp, steps):
         steps=steps
     )
 
+
+def get_multi_step_sparse_init_block(filters, name, top_n, router_temp, steps):
+    router_settings={
+        "heads": 4,
+        "dim_head": 32,
+        "mlp_hidden": 64,
+    }
+    router_reg={
+        "diversity_tau": 0.0,
+        "explore_eps": 0,
+        "ent_weight": 0.01,
+        "load_balance_weight": 0.05,
+        "route_temp": router_temp,
+    }
+
+    return SparseAdaptiveRouterMultiStep(
+        branches=[
+            ResidualBlock3x3(filters),
+            ResidualBlock5x5(filters, groups=2),
+            ResidualBlockDepthwise3x3(filters),
+            ResidualBlockDepthwise5x5(filters),
+            ResidualBlockDepthwise7x7(filters),
+            ChannelSE(ratio=4),
+            SpatialSE(),
+            SpatialAttention(kernel_size=7),
+            DummyBlock()
+        ],
+        router_reg=router_reg,
+        router_settings=router_settings,
+        dense_for_diversity=False,
+        name=name,
+        steps=steps
+    )
+
+def get_eff_block(filters, name, route_temp, router_dim, steps):
+
+    return EfficientMultiStepRouter(
+        branches=[
+            EfficientResidualBlockDepthwise3x3(filters),
+            EfficientResidualBlockDepthwise5x5(filters),
+            EfficientResidualBlockDepthwise7x7(filters),
+            ChannelSE(ratio=4),
+            SpatialSE(),
+            DummyBlock()
+        ],
+        route_temp=route_temp,
+        router_dim=router_dim,
+        name=name,
+        steps=steps
+    )
 
 def get_stem(branches, name, top_n, router_temp, diversity_tau):
     router_settings={

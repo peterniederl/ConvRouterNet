@@ -149,63 +149,116 @@ class RouterStatsCallback(keras.callbacks.Callback):
                 f"expert_hist={expert_hist.tolist()}"
             )
 
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
 
 class RouterStatsMultiStepCallback(keras.callbacks.Callback):
     """
-    Logs per-step expert usage for an AdaptiveRouterMultiStep layer.
-    Expects `trace_batch(model, x, layer_name=...)` to return
-    a dict with key "top_indices": list/array of shape [steps, batch].
+    Logs per-step expert usage and probability metrics for a (multi-step) router layer.
+    Expects `trace_batch(model, x, layer_name=...)` to return a dict with:
+        "top_indices": np.ndarray [T, B]
+        "probs":       np.ndarray [T, B, K]
     """
-    def __init__(self, x_val, y_val,
+    def __init__(self,
+                 x_val,
+                 y_val=None,
                  layer_name="adaptive_router",
                  batch_size=256,
                  verbose_every=5):
         super().__init__()
         self.xv = np.array(x_val)
-        self.yv = np.array(y_val)
+        self.yv = None if y_val is None else np.array(y_val)
         self.layer_name = layer_name
         self.bs = int(batch_size)
         self.verbose_every = int(verbose_every)
 
     def on_epoch_end(self, epoch, logs=None):
-        # Run occasionally
-        if epoch < 1 or ((epoch + 1) % self.verbose_every == 0):
-            layer = self.model.get_layer(self.layer_name)
-            K = layer.K
-            T = getattr(layer, "steps", 1)  # support both single-step and multi-step
+        # Run occasionally to avoid slowing training
+        if epoch >= 1 and ((epoch + 1) % self.verbose_every != 0):
+            return
 
-            steps_hist = np.zeros(T + 1, dtype=np.int64)
-            expert_hist = np.zeros((T, K), dtype=np.int64)
-            n_seen = 0
+        layer = self.model.get_layer(self.layer_name)
+        K = int(layer.K)
+        T = int(getattr(layer, "steps", 1))
 
-            # Iterate validation set in batches
-            for i in range(0, len(self.xv), self.bs):
-                xb = self.xv[i:i + self.bs]
-                # trace_batch() should return { "top_indices": np.ndarray [T,B] }
-                tb = trace_batch(self.model, xb, layer_name=self.layer_name)
-                top_indices = np.array(tb["top_indices"])  # shape [T, B]
+        # Histograms / accumulators
+        steps_hist   = np.zeros(T + 1, dtype=np.int64)     # index t+1 counts samples that reached step t
+        expert_hist  = np.zeros((T, K), dtype=np.int64)    # counts of argmax expert per step
 
-                B = top_indices.shape[1]
-                n_seen += B
+        # Probability-based accumulators
+        probs_sum    = np.zeros((T, K), dtype=np.float64)  # sum of probs per expert (for mean mass)
+        entropy_sum  = np.zeros(T, dtype=np.float64)       # sum of entropies per step
+        top1conf_sum = np.zeros(T, dtype=np.float64)       # sum of top-1 confidences per step
+        count_sum    = np.zeros(T, dtype=np.int64)         # number of samples seen per step
 
-                for t in range(T):
-                    choices = top_indices[t]  # [B]
-                    counts = np.bincount(choices, minlength=K)
-                    expert_hist[t] += counts
-                    steps_hist[t + 1] += B  # mark that B samples reached step t
+        # Optional eval
+        if self.yv is not None:
+            loss, acc = self.model.evaluate(self.xv, self.yv, batch_size=self.bs, verbose=0)
+            print(f"\n> [{self.layer_name}] epoch {epoch + 1}  eval: loss={loss:.4f}  acc={acc*100:.2f}%")
 
-            total_samples = max(1, steps_hist.sum())
-            avg_steps = float(np.sum(np.arange(T + 1) * steps_hist) / total_samples)
+        # Iterate validation set in batches
+        for i in range(0, len(self.xv), self.bs):
+            xb = self.xv[i:i + self.bs]
+            tb = trace_batch(self.model, xb, layer_name=self.layer_name)  # expects probs & top_indices
+            top_indices = np.asarray(tb["top_indices"])    # [T,B]
+            probs       = np.asarray(tb["probs"])          # [T,B,K]
 
-            # Print per-step expert usage
-            print(f"\n> [{self.layer_name}] epoch {epoch + 1}")
-            print(f"  avg_steps={avg_steps:.2f}")
-            for t in range(T):
-                usage = expert_hist[t]
-                total = usage.sum()
-                perc = 100 * usage / (total + 1e-6)
-                usage_str = "  ".join([f"E{i}:{p:4.1f}%" for i, p in enumerate(perc)])
-                print(f"  step {t+1:2d}: total={total:5d}  {usage_str}")
+            T_used, B = top_indices.shape[0], top_indices.shape[1]
+
+            # Update expert usage counts and steps histogram
+            for t in range(T_used):
+                choices = top_indices[t]                                # [B]
+                counts  = np.bincount(choices, minlength=K)             # [K]
+                expert_hist[t] += counts
+                steps_hist[t + 1] += B
+
+            # Probability metrics
+            # Entropy per sample: H = -sum_k p_k log p_k
+            p_clipped = np.clip(probs, 1e-9, 1.0)
+            ent = -np.sum(probs * np.log(p_clipped), axis=-1)           # [T,B]
+            top1conf = np.max(probs, axis=-1)                           # [T,B]
+
+            # Accumulate per step
+            probs_sum[:T_used]    += probs.sum(axis=1)                  # sum over batch -> [T,K]
+            entropy_sum[:T_used]  += ent.sum(axis=1)                    # [T]
+            top1conf_sum[:T_used] += top1conf.sum(axis=1)               # [T]
+            count_sum[:T_used]    += B
+
+        # Averages
+        total_samples = int(steps_hist[1:].sum())  # total samples counted across steps
+        avg_steps = 0.0 if total_samples == 0 else float(np.sum(np.arange(1, T + 1) * steps_hist[1:]) / max(steps_hist[1:].max(), 1))
+
+        # Print summary
+        print(f"\n> [{self.layer_name}] epoch {epoch + 1}")
+        print(f"  samples={int(count_sum.max()) if count_sum.size>0 else 0}  steps={T}  experts={K}")
+        print(f"  avg_steps={avg_steps:.2f}")
+        print(f"  steps_hist={steps_hist.tolist()}")
+
+        for t in range(T):
+            # Expert argmax usage (counts & percentage)
+            usage = expert_hist[t]
+            total = usage.sum()
+            if total == 0:
+                print(f"  step {t+1:2d}: total=0")
+                continue
+            perc = 100.0 * usage / total
+            usage_str = "  ".join([f"E{i}:{p:4.1f}%" for i, p in enumerate(perc)])
+
+            # Probability means
+            b_t = max(int(count_sum[t]), 1)
+            mean_mass = probs_sum[t] / b_t                                # mean prob mass per expert
+            mean_entropy = float(entropy_sum[t] / b_t)
+            mean_top1 = float(top1conf_sum[t] / b_t)
+
+            # Keep mean_mass compact: show up to first 10 experts; customize as needed
+            show_k = min(K, 10)
+            mass_preview = " ".join([f"E{i}:{m:.3f}" for i, m in enumerate(mean_mass[:show_k])])
+            tail_note = "" if K <= show_k else " ..."
+
+            print(f"  step {t+1:2d}: total={int(total):5d}  {usage_str}")
+            print(f"             mean_top1={mean_top1:.3f}  mean_entropy={mean_entropy:.3f}")
+            print(f"             mean_prob_mass: {mass_preview}{tail_note}")
 
 
 
@@ -278,6 +331,118 @@ def milestone_topn_schedule(milestones: Iterable[Tuple[int,int]]) -> Callable[[i
     return _sched
 
 
+def router_stats_multistep_once(
+    model,
+    x_val,
+    layer_name="efficient_router",   # name of your (multi-step) router layer
+    batch_size=256,
+    topk=None,                       # optional: restrict how many top-k indices trace_batch logs
+    verbose=True,
+):
+    """
+    Compute and (optionally) print per-step expert usage for a multi-step router layer.
+    Also aggregates probability metrics from trace_batch(...)[\"probs\"]:
+      - mean probability mass per expert (per step)
+      - mean top-1 confidence (per step)
+      - mean entropy of routing distribution (per step)
+
+    Returns a dict:
+      {
+        "steps":         T,
+        "experts":       K,
+        "samples":       n_seen,
+        "avg_steps":     average steps used,
+        "steps_hist":    np.ndarray [T+1],
+        "expert_hist":   np.ndarray [T,K],
+        "mean_prob_mass":np.ndarray [T,K],     # average p(e) per expert and step
+        "mean_top1":     np.ndarray [T],       # average max_k p_k per step
+        "mean_entropy":  np.ndarray [T],       # average -sum p log p per step
+      }
+    """
+    layer = model.get_layer(layer_name)
+    K = int(layer.K)
+    T = int(getattr(layer, "steps", 1))
+
+    steps_hist   = np.zeros(T + 1, dtype=np.int64)   # index t+1 counts samples that reached step t
+    expert_hist  = np.zeros((T, K), dtype=np.int64)
+    probs_sum    = np.zeros((T, K), dtype=np.float64)
+    entropy_sum  = np.zeros(T, dtype=np.float64)
+    top1_sum     = np.zeros(T, dtype=np.float64)
+    count_sum    = np.zeros(T, dtype=np.int64)
+
+    n_seen = 0
+
+    # Iterate validation set in batches and aggregate
+    for i in range(0, len(x_val), batch_size):
+        xb = x_val[i:i + batch_size]
+        tb = trace_batch(model, xb, layer_name=layer_name, topk=topk)  # expects {"top_indices":[T,B], "probs":[T,B,K]}
+        top_indices = np.asarray(tb["top_indices"])                     # [T, B]
+        probs       = np.asarray(tb["probs"])                           # [T, B, K]
+
+        T_used, B = top_indices.shape[0], top_indices.shape[1]
+        n_seen += B
+
+        # Histograms from argmax choices
+        for t in range(T_used):
+            choices = top_indices[t]                                    # [B]
+            counts  = np.bincount(choices, minlength=K)
+            expert_hist[t] += counts
+            steps_hist[t + 1] += B
+
+        # Probability metrics
+        # Entropy per sample: H = -sum_k p_k log p_k
+        p_clip = np.clip(probs[:T_used], 1e-9, 1.0)                     # [T_used,B,K]
+        ent    = -np.sum(p_clip * np.log(p_clip), axis=-1)              # [T_used,B]
+        top1   = np.max(probs[:T_used], axis=-1)                        # [T_used,B]
+
+        probs_sum[:T_used]   += probs[:T_used].sum(axis=1)              # [T_used,K]
+        entropy_sum[:T_used] += ent.sum(axis=1)                         # [T_used]
+        top1_sum[:T_used]    += top1.sum(axis=1)                        # [T_used]
+        count_sum[:T_used]   += B
+
+    total_samples = int(steps_hist[1:].sum())
+    avg_steps = 0.0 if total_samples == 0 else float(
+        np.sum(np.arange(1, T + 1) * steps_hist[1:]) / max(steps_hist[1:].max(), 1)
+    )
+
+    # Compute means safely
+    denom = np.maximum(count_sum, 1).astype(np.float64)                 # [T]
+    mean_prob_mass = np.divide(probs_sum, denom[:, None])               # [T,K]
+    mean_entropy   = np.divide(entropy_sum, denom)                      # [T]
+    mean_top1      = np.divide(top1_sum, denom)                         # [T]
+
+    if verbose:
+        print(f"\n> [{layer_name}] samples={n_seen}  steps={T}  experts={K}")
+        print(f"  avg_steps={avg_steps:.2f}")
+        print(f"  steps_hist={steps_hist.tolist()}")
+        for t in range(T):
+            usage = expert_hist[t]
+            total = usage.sum()
+            if total == 0:
+                print(f"  step {t+1:2d}: total=0")
+                continue
+            perc = 100.0 * usage / total
+            usage_str = "  ".join([f"E{i}:{p:4.1f}%" for i, p in enumerate(perc)])
+            print(f"  step {t+1:2d}: total={int(total):5d}  {usage_str}")
+            # Compact preview of mean prob mass (show first up to 10 experts)
+            show_k = min(K, 10)
+            mass_preview = " ".join([f"E{i}:{m:.3f}" for i, m in enumerate(mean_prob_mass[t,:show_k])])
+            tail = "" if K <= show_k else " ..."
+            print(f"             mean_top1={mean_top1[t]:.3f}  mean_entropy={mean_entropy[t]:.3f}")
+            print(f"             mean_prob_mass: {mass_preview}{tail}")
+
+    return {
+        "steps":         T,
+        "experts":       K,
+        "samples":       n_seen,
+        "avg_steps":     avg_steps,
+        "steps_hist":    steps_hist,
+        "expert_hist":   expert_hist,
+        "mean_prob_mass":mean_prob_mass,
+        "mean_top1":     mean_top1,
+        "mean_entropy":  mean_entropy,
+    }
+
 
 # -------- helpers --------
 
@@ -321,99 +486,77 @@ def _mix_topn(weights, y_stack, top_n):
     return tf.einsum('bk,bkhwc->bhwc', sparse_w, y_stack), topk.indices  # also return indices for tracing
 
 
-# -------- tracing (single sample or batch) --------
+
 
 def trace_and_predict(
     model,
     x_input,
     y_true=None,
-    layer_name="adaptive_router",
-    force_full=False,   # kept for API compatibility; unused
+    layer_name="efficient_router",   # <-- set to your EfficientMultiStepRouter layer name
+    topk=None,                       # how many top-k indices to log per step (None -> K)
 ):
     """
-    Runs the model, and traces per-step expert usage at `layer_name`.
+    Runs the model and traces per-step routing for an EfficientMultiStepRouter.
+
     Returns:
-      trace: {
-        "top_indices":  [T, B]          (top-1 per step),
-        "topk_indices": [T, B, k]       (top-n per step; k = min(top_n, K)),
-        "probs":        [T, B, K]       (softmax per step)
+      {
+        "trace": {
+          "top_indices":  [T, B],          # top-1 per step
+          "topk_indices": [T, B, k_eff],   # top-k per step (k_eff = min(topk or K, K))
+          "probs":        [T, B, K],       # softmax weights per step
+        },
+        "pred_probs":  model(x_input) output (numpy),
+        "pred_label":  argmax over last dim (if classification),
+        "true_label":  y_true (as provided),
+        "layer_info":  {K, steps, route_temp},
+        "correct":     (pred_label == y_true) if y_true provided else None,
       }
-      + predictions & some layer info
     """
     layer = model.get_layer(layer_name)
     steps = int(getattr(layer, "steps", 1))
     K = int(layer.K)
-    top_n = int(getattr(layer, "top_n", K))
+    k_eff = K if topk is None else int(min(topk, K))
 
-    # features BEFORE the router layer
+    # Features BEFORE the router layer
     pre = keras.Model(model.input, layer.input)
     x_in = tf.convert_to_tensor(x_input)
-    x = pre(x_in, training=False)
-
+    x = pre(x_in, training=False)                     # [B,H,W,C]
     B = int(x.shape[0])
-    dtype = x.dtype
-    H = tf.shape(x)[1]
-    W = tf.shape(x)[2]
+    temp = tf.cast(layer.route_temp, x.dtype)
 
-    # per-step containers
-    top1_all   = []
-    topk_all   = []
-    probs_all  = []
-
+    top1_all, topk_all, probs_all = [], [], []
     x_step = x
-    for t in range(steps):
-        router_out = layer.router(x_step, training=False)
-        logits, attn_map = _unpack_router_output(router_out, x_step)
 
-        weights = tf.nn.softmax(logits / layer.route_temp, axis=-1)  # [B,K]
-        # Optional exploration (if present)
-        explore_eps = float(getattr(layer, "explore_eps", 0.0) or 0.0)
-        if explore_eps > 0.0:
-            uni = tf.ones_like(weights) / tf.cast(tf.shape(weights)[1], weights.dtype)
-            eps = tf.cast(explore_eps, weights.dtype)
-            weights = (1.0 - eps) * weights + eps * uni
+    for _ in range(steps):
+        # Route once (CosineRouter returns logits only)
+        logits  = layer.router(x_step, training=False)           # [B,K]
+        weights = tf.nn.softmax(logits / temp, axis=-1)          # [B,K]
 
-        # apply attention gain if layer exposes alpha
-        scale = tf.cast(H * W, dtype)
-        if hasattr(layer, "alpha"):
-            alpha = layer.alpha  # use as-is to mirror your layer
-            x_mod = x_step * (1.0 + attn_map * scale * alpha)
-        else:
-            x_mod = x_step
-
-        # run all branches on the modified input
-        y_list = [br(x_mod, training=False) for br in layer.branches]   # list of [B,H,W,C]
-        y_stack = tf.stack(y_list, axis=1)                              # [B,K,H,W,C]
-
-        if top_n < K:
-            y_sel, topk_idx = _mix_topn(weights, y_stack, top_n)        # [B,H,W,C], [B,k]
-        else:
-            y_sel = tf.einsum('bk,bkhwc->bhwc', weights, y_stack)
-            # produce a consistent top-k set (argmax when k==1)
-            k_eff = tf.minimum(tf.shape(weights)[1], tf.cast(top_n, tf.int32))
-            topk_idx = tf.math.top_k(weights, k=k_eff).indices
-
-        # record trace
-        top1 = tf.argmax(weights, axis=-1, output_type=tf.int32)        # [B]
+        # Record stats
+        top1 = tf.argmax(weights, axis=-1, output_type=tf.int32) # [B]
+        topn = tf.math.top_k(weights, k=k_eff, sorted=True).indices  # [B,k_eff]
         top1_all.append(top1.numpy())
-        topk_all.append(topk_idx.numpy())
+        topk_all.append(topn.numpy())
         probs_all.append(weights.numpy())
 
-        # next step input
-        x_step = y_sel
+        # Compute ALL experts and dense mix (mirror layer)
+        y_list  = [br(x_step, training=False) for br in layer.branches]  # K × [B,H,W,C]
+        y_stack = tf.stack(y_list, axis=1)                                # [B,K,H,W,C]
+        x_step  = tf.einsum('bk,bkhwc->bhwc', weights, y_stack)           # next state
 
-    # model predictions (full forward)
+    # Full model predictions
     pred_probs = model(x_in, training=False).numpy()
-    pred_label = pred_probs.argmax(axis=-1).astype(np.int32)
+    pred_label = np.argmax(pred_probs, axis=-1) if pred_probs.ndim >= 2 else (pred_probs > 0.5).astype("int32")
+
     correct = None
     if y_true is not None:
         y_true_arr = np.asarray(y_true).reshape(-1)
-        correct = (pred_label == y_true_arr)
+        correct = (pred_label.reshape(-1) == y_true_arr)
 
     trace = {
-        "top_indices":  np.stack(top1_all, axis=0),   # [T, B]
-        "topk_indices": np.stack(topk_all, axis=0),   # [T, B, k]
-        "probs":        np.stack(probs_all, axis=0),  # [T, B, K]
+        "top_indices":  np.stack(top1_all, axis=0),   # [T,B]
+        "topk_indices": np.stack(topk_all, axis=0),   # [T,B,k_eff]
+        "probs":        np.stack(probs_all, axis=0),  # [T,B,K]
     }
     return {
         "trace": trace,
@@ -421,174 +564,80 @@ def trace_and_predict(
         "pred_label": pred_label,
         "true_label": None if y_true is None else np.asarray(y_true),
         "layer_info": {
-            "K": layer.K,
+            "K": K,
             "steps": steps,
-            "top_n": top_n,
-            "route_temp": getattr(layer, "route_temp", None),
+            "route_temp": float(layer.route_temp),
         },
         "correct": correct,
     }
 
 
-# def trace_batch(model, x_batch, layer_name="adaptive_router", force_full=False):
-#     """
-#     Same as trace_and_predict but only returns the trace for a batch.
-#     """
-#     layer = model.get_layer(layer_name)
-#     steps = int(getattr(layer, "steps", 1))
-#     K = int(layer.K)
-#     top_n = int(getattr(layer, "top_n", K))
-
-#     pre = keras.Model(model.input, layer.input)
-
-#     x_in = tf.convert_to_tensor(x_batch)
-#     x = pre(x_in, training=False)
-
-#     B = int(x.shape[0])
-#     dtype = x.dtype
-#     H = tf.shape(x)[1]
-#     W = tf.shape(x)[2]
-
-#     top1_all  = []
-#     topk_all  = []
-#     probs_all = []
-
-#     x_step = x
-#     for t in range(steps):
-#         router_out = layer.router(x_step, training=False)
-#         logits, attn_map = _unpack_router_output(router_out, x_step)
-
-#         weights = tf.nn.softmax(logits / layer.route_temp, axis=-1)    # [B,K]
-#         explore_eps = float(getattr(layer, "explore_eps", 0.0) or 0.0)
-#         if explore_eps > 0.0:
-#             uni = tf.ones_like(weights) / tf.cast(tf.shape(weights)[1], weights.dtype)
-#             eps = tf.cast(explore_eps, weights.dtype)
-#             weights = (1.0 - eps) * weights + eps * uni
-
-#         scale = tf.cast(H * W, dtype)
-#         if hasattr(layer, "alpha"):
-#             alpha = layer.alpha
-#             x_mod = x_step * (1.0 + attn_map * scale * alpha)
-#         else:
-#             x_mod = x_step
-
-#         y_stack = tf.stack([br(x_mod, training=False) for br in layer.branches], axis=1)  # [B,K,H,W,C]
-#         if top_n < K:
-#             y_sel, topk_idx = _mix_topn(weights, y_stack, top_n)
-#         else:
-#             y_sel = tf.einsum('bk,bkhwc->bhwc', weights, y_stack)
-#             k_eff = tf.minimum(tf.shape(weights)[1], tf.cast(top_n, tf.int32))
-#             topk_idx = tf.math.top_k(weights, k=k_eff).indices
-
-#         top1 = tf.argmax(weights, axis=-1, output_type=tf.int32)      # [B]
-#         top1_all.append(top1.numpy())
-#         topk_all.append(topk_idx.numpy())
-#         probs_all.append(weights.numpy())
-
-#         x_step = y_sel
-
-#     return {
-#         "top_indices":  np.stack(top1_all, axis=0),   # [T, B]
-#         "topk_indices": np.stack(topk_all, axis=0),   # [T, B, k]
-#         "probs":        np.stack(probs_all, axis=0),  # [T, B, K]
-#     }
-
-def trace_batch(model, x_batch, layer_name="adaptive_router", force_full=False):
+# ---------- TRACE (per batch) ----------
+def trace_batch(model, x_batch, layer_name="efficient_router", topk=None):
+    """
+    Traces routing decisions for EfficientMultiStepRouter:
+      - Returns per-step top-1 indices, top-k indices, and probabilities.
+      - Advances x the same way as the layer: dense mixture over ALL experts.
+    Args:
+      model: tf.keras.Model
+      x_batch: input batch (numpy or Tensor)
+      layer_name: name of the EfficientMultiStepRouter layer in the model
+      topk: if None, uses K; else restricts top-k logging to min(topk, K)
+    Returns dict with:
+      {
+        "top_indices":  [T, B],          # top-1 per step
+        "topk_indices": [T, B, k_eff],   # top-k per step
+        "probs":        [T, B, K],       # softmax weights per step
+      }
+    """
     layer = model.get_layer(layer_name)
+    assert hasattr(layer, "router") and hasattr(layer, "branches"), \
+        f"Layer '{layer_name}' must be an EfficientMultiStepRouter."
+
     steps = int(getattr(layer, "steps", 1))
     K = int(layer.K)
+    k_eff = K if topk is None else int(min(topk, K))
 
-    # features BEFORE the router layer
-    pre = tf.keras.Model(model.input, layer.input)
+    # Features BEFORE the router layer
+    pre = keras.Model(model.input, layer.input)
     x_in = tf.convert_to_tensor(x_batch)
     x = pre(x_in, training=False)
 
     B = int(x.shape[0])
-    H = tf.shape(x)[1]; W = tf.shape(x)[2]
-    dtype = x.dtype
+    temp = tf.cast(layer.route_temp, x.dtype)
 
     top1_all, topk_all, probs_all = [], [], []
 
-    # init mask
-    allowed = tf.ones([B, K], dtype=tf.float32)
-    last_idx = tf.constant(K - 1, tf.int32)
-
     x_step = x
-    for t in range(steps):
-        router_out = layer.router(x_step, training=False)
-        # unpack
-        if isinstance(router_out, (tuple, list)):
-            if len(router_out) == 3:
-                logits, _, attn_map = router_out
-            elif len(router_out) == 2:
-                logits, _ = router_out
-                attn_map = tf.zeros_like(x_step[..., :1])
-            else:
-                logits = router_out[0]
-                attn_map = tf.zeros_like(x_step[..., :1])
-        else:
-            logits = router_out
-            attn_map = tf.zeros_like(x_step[..., :1])
+    for _ in range(steps):
+        # Route once (CosineRouter returns logits only)
+        logits  = layer.router(x_step, training=False)            # [B,K]
+        weights = tf.nn.softmax(logits / temp, axis=-1)           # [B,K]
 
-        # HARD mask
-        neg_inf = tf.constant(-1e9, dtype=logits.dtype)
-        masked_logits = tf.where(allowed > 0.5, logits, neg_inf)
+        # Record stats
+        top1 = tf.argmax(weights, axis=-1, output_type=tf.int32)  # [B]
+        topn = tf.math.top_k(weights, k=k_eff, sorted=True).indices  # [B,k_eff]
 
-        # softmax + optional exploration
-        weights = tf.nn.softmax(masked_logits / layer.route_temp, axis=-1)
-        explore_eps = float(getattr(layer, "explore_eps", 0.0) or 0.0)
-        if explore_eps > 0.0:
-            uni = tf.ones_like(weights) / tf.cast(tf.shape(weights)[1], weights.dtype)
-            weights = (1.0 - explore_eps) * weights + explore_eps * uni
-
-        top_idx = tf.argmax(weights, axis=-1, output_type=tf.int32)
-        k_eff = tf.minimum(tf.shape(weights)[1], tf.cast(getattr(layer, "top_n", K), tf.int32))
-        topk_idx = tf.math.top_k(weights, k=k_eff).indices
-
-        # record
-        top1_all.append(top_idx.numpy())
-        topk_all.append(topk_idx.numpy())
+        top1_all.append(top1.numpy())
+        topk_all.append(topn.numpy())
         probs_all.append(weights.numpy())
 
-        # attention gain (same as layer)
-        scale = tf.cast(H * W, dtype)
-        alpha = layer.alpha if hasattr(layer, "alpha") else tf.constant(0.0, dtype)
-        x_mod = x_step * (1.0 + attn_map * scale * alpha)
-
-        # advance x by running ONLY the selected expert (sparse) or your dense path
-        # (if your layer is sparse, mirror it here; otherwise, you can do a dense mix)
-
-        # update allowed: disallow chosen unless it's last
-        not_last = tf.cast(tf.not_equal(top_idx, last_idx), allowed.dtype)
-        idx = tf.stack([tf.range(B), top_idx], axis=1)
-        delta = tf.scatter_nd(idx, not_last, tf.shape(allowed))
-        allowed = tf.clip_by_value(allowed - delta, 0.0, 1.0)
-        # always keep last allowed
-        last_vec = tf.one_hot(tf.fill([B], last_idx), depth=K, dtype=allowed.dtype)
-        allowed = tf.maximum(allowed, last_vec)
-
-        # If you want to fully mirror the layer’s x update, compute y_sel here as well.
-        # For stats only, you can skip advancing x_step; masking still reflects the rule.
-        x_step = x_step  # or update like the layer
+        # Compute ALL experts, dense mixture (mirror layer)
+        y_list  = [br(x_step, training=False) for br in layer.branches]  # K × [B,H,W,C]
+        y_stack = tf.stack(y_list, axis=1)                               # [B,K,H,W,C]
+        x_step  = tf.einsum('bk,bkhwc->bhwc', weights, y_stack)          # [B,H,W,C]
 
     return {
-        "top_indices":  np.stack(top1_all, axis=0),   # [T, B]
-        "topk_indices": np.stack(topk_all, axis=0),   # [T, B, k]
-        "probs":        np.stack(probs_all, axis=0),  # [T, B, K]
+        "top_indices":  np.stack(top1_all, axis=0),    # [T,B]
+        "topk_indices": np.stack(topk_all, axis=0),    # [T,B,k_eff]
+        "probs":        np.stack(probs_all, axis=0),   # [T,B,K]
     }
 
 
-
-
-def print_router_stats(model, x, y, layer_name="adaptive_router", batch_size=512):
+# ---------- AGGREGATE / PRINT STATS ----------
+def print_router_stats(model, x, y, layer_name="efficient_router", batch_size=512, topk=None):
     """
-    Prints accuracy and per-step expert usage for a (multi-step) router layer.
-    Requires `trace_batch` to return:
-        {
-          "top_indices":  [T, B],   # top-1 expert per step
-          "topk_indices": [T, B, k],
-          "probs":        [T, B, K]
-        }
+    Evaluates the model and prints per-step expert usage for EfficientMultiStepRouter.
     """
     # Eval once for accuracy
     loss, acc = model.evaluate(x, y, batch_size=batch_size, verbose=0)
@@ -596,22 +645,22 @@ def print_router_stats(model, x, y, layer_name="adaptive_router", batch_size=512
     layer = model.get_layer(layer_name)
     K = int(layer.K)
     T = int(getattr(layer, "steps", 1))
+    k_eff = K if topk is None else int(min(topk, K))
 
-    steps_hist  = np.zeros(T + 1, dtype=np.int64)  # index t+1 counts samples that reached step t
+    steps_hist  = np.zeros(T + 1, dtype=np.int64)   # index t+1 counts samples that reached step t
     expert_hist = np.zeros((T, K), dtype=np.int64)
     n_seen = 0
 
     # Aggregate per-step counts
     for i in range(0, len(x), batch_size):
         xb = x[i:i + batch_size]
-        tb = trace_batch(model, xb, layer_name=layer_name)  # uses your multi-step trace
-        top1 = tb["top_indices"]  # [T, B]
+        tb = trace_batch(model, xb, layer_name=layer_name, topk=k_eff)
+        top1 = tb["top_indices"]  # [T,B]
         T_used, B = top1.shape
         n_seen += B
 
         for t in range(T_used):
-            choices = top1[t]  # [B]
-            counts = np.bincount(choices, minlength=K)
+            counts = np.bincount(top1[t], minlength=K)
             expert_hist[t] += counts
             steps_hist[t + 1] += B
 
@@ -628,24 +677,55 @@ def print_router_stats(model, x, y, layer_name="adaptive_router", batch_size=512
         if total == 0:
             print(f"Step {t+1:2d}: total=0")
             continue
-        perc = 100 * usage / total
+        perc = 100.0 * usage / total
         usage_str = "  ".join([f"E{i}:{p:4.1f}%" for i, p in enumerate(perc)])
         print(f"Step {t+1:2d}: total={int(total):5d}  {usage_str}")
 
 
-
-
-def print_trace_for_samples(model, x, y, layer_name="adaptive_router", start=0, end=10):
+# ---------- TRACE + PREDICT (for sample ranges) ----------
+def trace_and_predict(model, x, y_true=None, layer_name="efficient_router"):
     """
-    Prints routing trace and prediction for samples in the given range (single step).
+    Runs a forward pass to get prediction, and traces router for the same sample(s).
+    Returns:
+      {
+        "pred":       model logits/probs (as returned by model(x)),
+        "pred_label": argmax labels (if classification),
+        "true_label": provided y_true (if given),
+        "trace":      output of trace_batch(...)
+      }
+    """
+    pred = model.predict(x, verbose=0)
+    if pred.ndim >= 2:
+        pred_label = np.argmax(pred, axis=-1)
+    else:
+        pred_label = (pred > 0.5).astype("int32")
+
+    trace = trace_batch(model, x, layer_name=layer_name)
+
+    return {
+        "pred": pred,
+        "pred_label": pred_label,
+        "true_label": y_true if y_true is not None else None,
+        "trace": trace,
+    }
+
+
+def print_trace_for_samples(model, x, y, layer_name="efficient_router", start=0, end=10):
+    """
+    Prints routing trace and prediction for samples in the given range.
     """
     print("")
     print(f"================== {layer_name} ====================")
+    end = min(end, len(x))
     for i in range(start, end):
-        res = trace_and_predict(model, x[i:i+1], y_true=y[i:i+1], layer_name=layer_name)
+        xi = x[i:i+1]
+        yi = y[i:i+1] if y is not None else None
+        res = trace_and_predict(model, xi, y_true=yi, layer_name=layer_name)
         trace = res["trace"]
-        if trace["top_indices"].shape[0] > 0:
-            print(" > pred label:", res["pred_label"][0], "true label:", int(res["true_label"][0]))
-            print("   expert (single step):", trace["top_indices"][0, 0])
-
-   
+        T, B = trace["top_indices"].shape
+        if T > 0 and B > 0:
+            print(" > pred label:", int(res["pred_label"][0]),
+                  "true label:", int(yi[0]) if yi is not None else None)
+            # Show top-1 per step for this sample
+            seq = trace["top_indices"][:, 0].tolist()
+            print("   experts per step:", seq)

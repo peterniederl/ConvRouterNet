@@ -6,3 +6,7 @@ venv
 *cpython*.pyc
 .DS_Store
 /__pycache__
+__pycache__/utils.cpython-38.pyc
+__pycache__/utils.cpython-38.pyc
+__pycache__/InitConvRouterNet.cpython-38.pyc
+__pycache__/callbacks.cpython-38.pyc
