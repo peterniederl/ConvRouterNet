@@ -3,7 +3,7 @@ from tensorflow import keras
 import matplotlib.pyplot as plt
 from tensorflow.keras import layers
 from tensorflow.keras.layers import (
-    Conv2DTranspose, MaxPool2D, Add, Conv2D, Dense, Flatten, Dropout, LayerNormalization, 
+    Conv2DTranspose, MaxPool2D, Add, Conv2D, Dense, Flatten, Dropout, LayerNormalization, BatchNormalization,
     DepthwiseConv2D, AveragePooling2D, GlobalAveragePooling2D
 )
 
@@ -802,6 +802,129 @@ class AttnPoolRouter(layers.Layer):
         attn_map = tf.reduce_mean(attn, axis=1)              # [B,1,HW]
         attn_map = tf.reshape(attn_map, [B, H, W, 1])        # [B,H,W,1]
         return logits, pooled_flat, attn_map
+    
+
+
+
+# --- tiny cosine router (no attn_map / pooled) ---
+class CosineRouter(layers.Layer):
+    def __init__(self, K, dim=128, **kw):
+        super().__init__(**kw)
+        self.K = int(K)
+        self.dim = int(dim)
+        self.proj = layers.Dense(self.dim, use_bias=False, kernel_initializer="glorot_uniform")
+        self.protos = self.add_weight(
+            name="protos",
+            shape=(self.K, self.dim),
+            initializer="glorot_uniform",
+            trainable=True,
+        )
+
+    def call(self, x, training=None):
+        # x: [B,H,W,C] -> GAP -> project -> cosine similarities -> [B,K] logits
+        z = tf.reduce_mean(x, axis=[1, 2])                 # [B,C]
+        z = tf.nn.l2_normalize(self.proj(z), axis=-1)      # [B,D]
+        p = tf.nn.l2_normalize(self.protos, axis=-1)       # [K,D]
+        return tf.matmul(z, p, transpose_b=True)           # [B,K]
+
+
+class EfficientMultiStepRouter(layers.Layer):
+    """
+    Multi-step router (dense mixture):
+      - Route with CosineRouter (fast, no attn map).
+      - Compute ALL experts each step.
+      - Output = weighted sum over experts (softmax(logits/temperature)).
+      - Adds cosine diversity loss across expert outputs each step:
+            L_div = tau * mean_offdiag( cos(Y_e, Y_e')^2 )
+        where Y_e are flattened expert outputs (per batch).
+      - Experts may be reused across steps.
+    """
+    def __init__(
+        self,
+        branches,
+        steps=3,
+        router_dim=128,
+        route_temp=1.5,
+        diversity_tau=0.005,        # strength of diversity regularizer (0 disables)
+        return_all=False,
+        name=None,
+    ):
+        super().__init__(name=name)
+        self.branches = branches
+        self.K = len(branches)
+        self.steps = int(steps)
+        self._route_temp = float(route_temp)
+        self.diversity_tau = float(diversity_tau)
+        self.return_all = bool(return_all)
+        self.router = CosineRouter(K=self.K, dim=int(router_dim))
+
+    @property
+    def route_temp(self): return self._route_temp
+    @route_temp.setter
+    def route_temp(self, v): self._route_temp = float(v)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update(dict(
+            steps=self.steps,
+            route_temp=self.route_temp,
+            router_dim=self.router.dim,
+            diversity_tau=self.diversity_tau,
+            K=self.K,
+            return_all=self.return_all,
+        ))
+        return cfg
+
+    @staticmethod
+    def _diversity_loss(y_list):
+        """
+        Cosine-sim diversity across experts' outputs.
+        y_list: list length K of tensors [B,H,W,C].
+        Returns scalar loss.
+        """
+        B = tf.shape(y_list[0])[0]
+        # Stack experts and flatten per-sample: [B, K, D]
+        Y = tf.stack([tf.reshape(y, [B, -1]) for y in y_list], axis=1)
+        Y = tf.nn.l2_normalize(Y, axis=-1)                     # cosine
+        sims = tf.matmul(Y, Y, transpose_b=True)               # [B, K, K]
+        K_t = tf.shape(Y)[1]
+        mask = 1.0 - tf.eye(K_t, dtype=Y.dtype)
+        off = sims * mask
+        denom = tf.cast(K_t * (K_t - 1), Y.dtype)
+        return tf.reduce_mean(tf.reduce_sum(tf.square(off), axis=[1, 2]) / (denom + 1e-6))
+
+    def call(self, x, training=None):
+        outputs_all = []
+        temp = tf.cast(self.route_temp, x.dtype)
+        div_acc = tf.constant(0.0, dtype=x.dtype)
+
+        for _ in range(self.steps):
+            # 1) Route once
+            logits  = self.router(x, training=training)            # [B,K]
+            weights = tf.nn.softmax(logits / temp, axis=-1)        # [B,K]
+
+            # 2) Compute ALL experts (dense)
+            y_list  = [br(x, training=training) for br in self.branches]   # K × [B,H,W,C]
+            y_stack = tf.stack(y_list, axis=1)                               # [B,K,H,W,C]
+
+            # 3) Weighted sum over experts
+            y_mix = tf.einsum('bk,bkhwc->bhwc', weights, y_stack)           # [B,H,W,C]
+
+            # 4) Diversity penalty (accumulate per step)
+            if training and self.diversity_tau > 0.0:
+                div_acc += self._diversity_loss(y_list)
+
+            # 5) Advance state
+            x = y_mix
+            if self.return_all:
+                outputs_all.append(x)
+
+        # Add averaged diversity loss across steps
+        if training and self.diversity_tau > 0.0:
+            steps_f = tf.cast(self.steps, x.dtype)
+            self.add_loss(self.diversity_tau * (div_acc / steps_f))
+
+        return outputs_all if self.return_all else x
 
 
 class FeatureModulator(layers.Layer):
@@ -1043,6 +1166,114 @@ class Depthwise7x7ConvPoolingLayer(keras.layers.Layer):
         x = self.channel_up_norm(x)
         x = self.channel_up_swish(x)
         return x
+    
+
+
+class EfficientDownsample(layers.Layer):
+    """
+    Efficient stride-2 downsampler.
+
+    mode='conv':      Conv2D(kxk, stride=2, groups=groups) -> [optional Norm] -> [optional Act]
+    mode='depthwise': DWConv(kxk, stride=2) -> PWConv(1x1)  -> [optional Norm] -> [optional Act]
+
+    Notes:
+      - We place Norm (if any) AFTER the channel-mixing 1x1 (or Conv2D) so it normalizes the final channels.
+      - We use_bias = (norm is None) to avoid redundant bias when a norm follows.
+    """
+    def __init__(self, filters, kernel_size=3, mode='conv', groups=1, norm=None, act='swish', **kw):
+        super().__init__(**kw)
+        self.filters    = int(filters)
+        self.kernel_size= int(kernel_size)
+        self.mode       = mode          # 'conv' or 'depthwise'
+        self.groups     = int(groups)
+        self.norm_kind  = norm          # None | 'ln' | 'bn'
+        self.act_kind   = act           # None | 'relu' | 'swish' | 'gelu'
+
+        if self.mode not in ('conv', 'depthwise'):
+            raise ValueError("mode must be 'conv' or 'depthwise'")
+
+    def build(self, input_shape):
+        use_bias = (self.norm_kind is None)
+
+        if self.mode == 'conv':
+            # One fused stride-2 conv
+            self.op = Conv2D(
+                self.filters, self.kernel_size, strides=2, padding='same',
+                groups=self.groups, use_bias=use_bias, kernel_initializer="he_normal"
+            )
+            self.op2 = None
+        else:
+            # Depthwise stride-2 + 1x1 pointwise
+            self.op  = DepthwiseConv2D(
+                self.kernel_size, strides=2, padding='same',
+                use_bias=False, kernel_initializer="he_normal"
+            )
+            self.op2 = Conv2D(
+                self.filters, 1, padding='same', use_bias=use_bias, kernel_initializer="he_normal"
+            )
+
+        # Optional norm
+        if self.norm_kind == 'ln':
+            self.norm = LayerNormalization(axis=-1)
+        elif self.norm_kind == 'bn':
+            self.norm = BatchNormalization(momentum=0.9, epsilon=1e-5)
+        else:
+            self.norm = None
+
+        # Optional activation
+        if self.act_kind is None:
+            self.act = None
+        elif self.act_kind == 'relu':
+            self.act = layers.Activation('relu')
+        elif self.act_kind == 'gelu':
+            self.act = layers.Activation('gelu')
+        else:
+            self.act = layers.Activation('swish')  # default
+        super().build(input_shape)
+
+    def call(self, x, training=None):
+        y = self.op(x)
+        if self.op2 is not None:
+            y = self.op2(y)
+        if self.norm is not None:
+            y = self.norm(y, training=training) if isinstance(self.norm, BatchNormalization) else self.norm(y)
+        if self.act is not None:
+            y = self.act(y)
+        return y
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update(dict(
+            filters=self.filters, kernel_size=self.kernel_size, mode=self.mode,
+            groups=self.groups, norm=self.norm_kind, act=self.act_kind,
+        ))
+        return cfg
+
+
+# Conv stride-2 variants
+class EfficientConv3x3PoolingLayer(EfficientDownsample):
+    def __init__(self, filters, groups=1, norm=None, act=None, **kw):
+        super().__init__(filters, kernel_size=3, mode='conv', groups=groups, norm=norm, act=act, **kw)
+
+class EfficientConv5x5PoolingLayer(EfficientDownsample):
+    def __init__(self, filters, groups=1, norm=None, act=None, **kw):
+        super().__init__(filters, kernel_size=5, mode='conv', groups=groups, norm=norm, act=act, **kw)
+
+# Depthwise stride-2 + 1x1 variants
+class EfficientDepthwise3x3ConvPoolingLayer(EfficientDownsample):
+    def __init__(self, filters, groups=1, norm=None, act=None, **kw):
+        super().__init__(filters, kernel_size=3, mode='depthwise', groups=groups, norm=norm, act=act, **kw)
+
+class EfficientDepthwise5x5ConvPoolingLayer(EfficientDownsample):
+    def __init__(self, filters, groups=1, norm=None, act=None, **kw):
+        super().__init__(filters, kernel_size=5, mode='depthwise', groups=groups, norm=norm, act=act, **kw)
+
+class EfficientDepthwise7x7ConvPoolingLayer(EfficientDownsample):
+    def __init__(self, filters, groups=1, norm=None, act=None, **kw):
+        super().__init__(filters, kernel_size=7, mode='depthwise', groups=groups, norm=norm, act=act, **kw)
+
+
+
 
 # ---------------------------------------------------------
 # Your GroupConv2D (unchanged)
@@ -1070,6 +1301,70 @@ class GroupConv2D(layers.Layer):
         splits = tf.split(x, num_or_size_splits=self.groups, axis=-1)
         outs = [conv(s) for conv, s in zip(self.convs, splits)]
         return tf.concat(outs, axis=-1)
+
+
+
+class EfficientResidual(layers.Layer):
+    def __init__(self, filters, kernel_size=3, reduce=2, use_depthwise=True, **kw):
+        super().__init__(**kw)
+        self.filters = int(filters)
+        self.kernel_size = int(kernel_size)
+        self.reduce = max(1, int(reduce))
+        self.use_depthwise = bool(use_depthwise)
+
+    def build(self, input_shape):
+        mid = max(8, self.filters // self.reduce)
+        self.pw1 = layers.Conv2D(mid, 1, padding="same", use_bias=False, name="pw_reduce")
+        if self.use_depthwise:
+            self.spatial = layers.DepthwiseConv2D(self.kernel_size, padding="same", use_bias=False, name="dw")
+        else:
+            self.spatial = layers.Conv2D(mid, self.kernel_size, padding="same", use_bias=False, name="conv3x3")
+        self.ln  = layers.LayerNormalization(axis=-1, name="ln")
+        self.pw2 = layers.Conv2D(self.filters, 1, padding="same", use_bias=False, name="pw_restore")
+        super().build(input_shape)
+
+    def call(self, x, training=None):
+        shortcut = x
+        y = self.pw1(x)
+        y = self.spatial(y)
+        y = self.ln(y)
+        y = tf.nn.swish(y)
+        y = self.pw2(y)
+        if x.shape[-1] != self.filters:
+            shortcut = layers.Conv2D(self.filters, 1, padding="same", use_bias=False, name="proj")(shortcut)
+        y = layers.Add()([shortcut, y])
+        return tf.nn.swish(y)
+
+class EfficientResidualBlock3x3(EfficientResidual):
+    def __init__(self, filters, block_reduction=2, **kw):
+        super().__init__(filters, kernel_size=3, reduce=block_reduction, use_depthwise=False, **kw)
+
+class EfficientResidualBlockDepthwise3x3(EfficientResidual):
+    def __init__(self, filters, block_reduction=2, **kw):
+        super().__init__(filters, kernel_size=3, reduce=block_reduction, use_depthwise=True, **kw)
+
+  
+class EfficientResidualBlock5x5(EfficientResidual):
+    def __init__(self, filters, block_reduction=2, groups=1, kernel_size=(5,5), **kw):
+        super().__init__(filters, kernel_size=5, reduce=block_reduction, use_depthwise=False, **kw)
+
+class EfficientResidualBlock7x7(EfficientResidual):
+    def __init__(self, filters, block_reduction=4, groups=1, kernel_size=(7,7), **kw):
+        super().__init__(filters, kernel_size=7, reduce=block_reduction, use_depthwise=False, **kw)
+
+class EfficientResidualBlockDepthwise5x5(EfficientResidual):
+    def __init__(self, filters, block_reduction=2, groups=1, kernel_size=(5,5), **kw):
+        super().__init__(filters, kernel_size=5, reduce=block_reduction, use_depthwise=True, **kw)
+
+class EfficientResidualBlockDepthwise7x7(EfficientResidual):
+    def __init__(self, filters, block_reduction=2, groups=1, kernel_size=(7,7), **kw):
+        super().__init__(filters, kernel_size=7, reduce=block_reduction, use_depthwise=True, **kw)
+
+class EfficientResidualBlockDepthwise9x9(EfficientResidual):
+    def __init__(self, filters, block_reduction=2, groups=1, kernel_size=(9,9), **kw):
+        super().__init__(filters, kernel_size=9, reduce=block_reduction, use_depthwise=True, **kw)
+
+
 
 # ---------------------------------------------------------
 # Your ResidualBlock (as provided; VALID 3x3s and projection)
